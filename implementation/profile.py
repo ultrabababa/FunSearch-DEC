@@ -79,7 +79,10 @@ class Profiler:
         content = {
             'sample_order': sample_order,
             'function': function_str,
-            'score': score
+            'score': score,
+            'status': getattr(programs, 'status', None),
+            'sample_time': getattr(programs, 'sample_time', None),
+            'evaluate_time': getattr(programs, 'evaluate_time', None),
         }
         path = os.path.join(self._json_dir, f'samples_{sample_order}.json')
         with open(path, 'w') as json_file:

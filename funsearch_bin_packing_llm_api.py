@@ -2,6 +2,13 @@ import json
 import multiprocessing
 from typing import Collection, Any
 import http.client
+import os
+from datetime import datetime
+import re
+import hashlib
+from urllib.parse import urlparse
+import ast
+import numpy as np
 from implementation import funsearch
 from implementation import config
 from implementation import sampler
@@ -10,11 +17,77 @@ from implementation import evaluator
 from implementation import code_manipulation
 import bin_packing_utils
 
-import json
-import multiprocessing
-from typing import Collection, Any
-import http.client
-from implementation import sampler
+
+def _resolve_log_dir() -> str:
+    return os.getenv('FUNSEARCH_LOG_DIR', 'logs/funsearch_llm_api').rstrip('/')
+
+
+def _resolve_proxy_endpoint(proxy_url: str) -> tuple[str, int]:
+    parsed = urlparse(proxy_url if '://' in proxy_url else f'http://{proxy_url}')
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f'Invalid proxy URL: {proxy_url}')
+    if parsed.port is not None:
+        return host, parsed.port
+    default_port = 443 if parsed.scheme.lower() == 'https' else 80
+    return host, default_port
+
+
+def _save_sample(log_dir: str, tag: str, sample_order: int, sample_idx: int, content: str) -> str:
+    os.makedirs(log_dir, exist_ok=True)
+    file_name = f'sample_{sample_order:05d}_{sample_idx:02d}_{tag}.txt'
+    file_path = os.path.join(log_dir, file_name)
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    return file_path
+
+
+def _save_round_manifest(log_dir: str, sample_order: int, manifest: dict) -> str:
+    os.makedirs(log_dir, exist_ok=True)
+    file_name = f'sample_{sample_order:05d}_manifest.json'
+    file_path = os.path.join(log_dir, file_name)
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    return file_path
+
+
+def _build_chat_payload(prompt: str, model: str, disable_thinking: bool, thinking_mode: str = 'both') -> dict:
+    payload = {
+        "max_tokens": 512,
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a Python code generator. Output only valid Python code. Never output reasoning or explanations.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    }
+    if disable_thinking:
+        if thinking_mode in ('both', 'chat_template'):
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if thinking_mode in ('both', 'alibaba'):
+            payload["enable_thinking"] = False
+    return payload
+
+
+def _resolve_disable_thinking(disable_thinking_env: str, model_name: str) -> bool:
+    mode = (disable_thinking_env or 'auto').strip().lower()
+    if mode in ('1', 'true', 'yes', 'on'):
+        return True
+    if mode in ('0', 'false', 'no', 'off'):
+        return False
+
+    # auto mode
+    lowered = (model_name or '').lower()
+    if 'qwen3.5' in lowered:
+        return True
+    if 'coder' in lowered and 'instruct' in lowered:
+        return False
+    return False
 
 
 def _trim_preface_of_body(sample: str) -> str:
@@ -37,12 +110,27 @@ def _trim_preface_of_body(sample: str) -> str:
     This function aims to ...
     -------------------------------------
     """
+    if not sample:
+        return ''
+
+    if '<think>' in sample.lower() and '</think>' in sample.lower():
+        sample = re.sub(r'<think>.*?</think>', '', sample, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    code_blocks = re.findall(r'```(?:python)?\s*(.*?)```', sample, flags=re.DOTALL | re.IGNORECASE)
+    if code_blocks:
+        candidate = ''
+        for block in code_blocks:
+            if 'def ' in block and len(block) > len(candidate):
+                candidate = block
+        if candidate:
+            sample = candidate
+
     lines = sample.splitlines()
     func_body_lineno = 0
     find_def_declaration = False
     for lineno, line in enumerate(lines):
         # find the first 'def' statement in the given code
-        if line[:3] == 'def':
+        if line.strip().startswith('def '):
             func_body_lineno = lineno
             find_def_declaration = True
             break
@@ -50,8 +138,50 @@ def _trim_preface_of_body(sample: str) -> str:
         code = ''
         for line in lines[func_body_lineno + 1:]:
             code += line + '\n'
-        return code
-    return sample
+        if _is_valid_function_body(code):
+            return code
+        return ''
+
+    # If model returns only code body (already indented), keep it.
+    body_lines = [line for line in lines if line.strip()]
+    if body_lines and all(line.startswith('    ') or line.startswith('\t') for line in body_lines):
+        if any(token in line for line in body_lines for token in ('return', 'if ', 'for ', 'while ', '=')):
+            body = '\n'.join(body_lines) + '\n'
+            if _is_valid_function_body(body):
+                return body
+            return ''
+
+    # Fallback: accept direct body-style output only if lines look like Python code.
+    stripped = [line.strip() for line in lines if line.strip()]
+    if stripped and all(not line.lower().startswith('thinking') for line in stripped):
+        python_like = any(
+            token in line
+            for line in stripped
+            for token in ('return ', 'if ', 'for ', 'while ', 'np.', 'bins', 'item', '=', 'elif ', 'else:')
+        )
+        if python_like:
+            if _is_valid_function_body(sample):
+                return sample
+            return ''
+
+    # Invalid response (e.g. chain-of-thought only).
+    return ''
+
+
+def _is_valid_function_body(body: str) -> bool:
+    if not body.strip():
+        return False
+    lines = body.splitlines()
+    if any(line.rstrip().endswith('=') for line in lines if line.strip()):
+        return False
+    if any(line.rstrip().endswith('(') for line in lines if line.strip()):
+        return False
+    source = "def _tmp(item, bins):\n" + body
+    try:
+        ast.parse(source)
+    except SyntaxError:
+        return False
+    return True
 
 
 class LLMAPI(sampler.LLM):
@@ -62,44 +192,130 @@ class LLMAPI(sampler.LLM):
         super().__init__(samples_per_prompt)
         additional_prompt = ('Complete a different and more complex Python function. '
                              'Be creative and you can insert multiple if-else and for-loop in the code logic.'
-                             'Only output the Python code, no descriptions.')
+                             'Only output Python code body lines (indented), no markdown, no explanation, no thinking process.')
         self._additional_prompt = additional_prompt
         self._trim = trim
+        self._host = os.getenv('FUNSEARCH_LLM_HOST', 'api.chatanywhere.com.cn')
+        self._path = os.getenv('FUNSEARCH_LLM_PATH', '/v1/chat/completions')
+        self._model = os.getenv('FUNSEARCH_LLM_MODEL', 'gpt-3.5-turbo')
+        self._api_key = os.getenv('FUNSEARCH_LLM_API_KEY', '')
+        self._use_https = os.getenv('FUNSEARCH_LLM_USE_HTTPS', '1') == '1'
+        self._verbose_samples = os.getenv('FUNSEARCH_VERBOSE_SAMPLES', '1') == '1'
+        default_sample_dir = os.path.join(_resolve_log_dir(), 'raw_samples')
+        self._sample_log_dir = os.getenv('FUNSEARCH_SAMPLE_LOG_DIR', default_sample_dir)
+        self._prompt_round = 0
+        self._disable_thinking = _resolve_disable_thinking(
+            os.getenv('FUNSEARCH_DISABLE_THINKING', 'auto'),
+            self._model,
+        )
+        self._thinking_param_mode = os.getenv('FUNSEARCH_THINKING_PARAM_MODE', 'both')
+        self._max_non_code_retries = int(os.getenv('FUNSEARCH_MAX_NON_CODE_RETRIES', '0'))
 
     def draw_samples(self, prompt: str) -> Collection[str]:
         """Returns multiple predicted continuations of `prompt`."""
-        return [self._draw_sample(prompt) for _ in range(self._samples_per_prompt)]
+        self._prompt_round += 1
+        all_samples = []
+        round_manifest = {
+            'prompt_round': self._prompt_round,
+            'created_at': datetime.now().isoformat(),
+            'samples_per_prompt': self._samples_per_prompt,
+            'samples': [],
+        }
+        prompt_path = os.path.join(self._sample_log_dir, f'sample_{self._prompt_round:05d}_prompt.txt')
+        os.makedirs(self._sample_log_dir, exist_ok=True)
+        with open(prompt_path, 'w', encoding='utf-8') as f:
+            f.write(prompt)
+        round_manifest['prompt_file'] = prompt_path
 
-    def _draw_sample(self, content: str) -> str:
-        prompt = '\n'.join([content, self._additional_prompt])
+        for idx in range(1, self._samples_per_prompt + 1):
+            raw_response = self._draw_sample(prompt)
+            original_response = raw_response
+            trimmed_response = _trim_preface_of_body(raw_response) if self._trim else raw_response
+            accepted = bool(trimmed_response.strip())
+            if accepted:
+                all_samples.append(trimmed_response)
+
+            raw_path = _save_sample(self._sample_log_dir, 'raw', self._prompt_round, idx, original_response)
+            trimmed_path = _save_sample(self._sample_log_dir, 'trimmed', self._prompt_round, idx, trimmed_response)
+            round_manifest['samples'].append({
+                'sample_index': idx,
+                'raw_file': raw_path,
+                'trimmed_file': trimmed_path,
+                'raw_length': len(raw_response),
+                'trimmed_length': len(trimmed_response),
+                'accepted_for_eval': accepted,
+            })
+
+            if self._verbose_samples:
+                print(f'================= Prompt Round {self._prompt_round} / Sample {idx}/{self._samples_per_prompt} (RAW) =================')
+                print(raw_response)
+                print(f'================= Prompt Round {self._prompt_round} / Sample {idx}/{self._samples_per_prompt} (TRIMMED) =================')
+                print(trimmed_response)
+                if not accepted:
+                    print('WARNING: sample rejected (empty/non-code after trim), skipped from evaluation.')
+
+        manifest_path = _save_round_manifest(self._sample_log_dir, self._prompt_round, round_manifest)
+        if self._verbose_samples:
+            print(f'================= Prompt Round {self._prompt_round} MANIFEST =================')
+            print(manifest_path)
+
+        return all_samples
+
+    def _draw_sample(self, prompt: str) -> str:
+        prompt = '\n'.join([prompt, self._additional_prompt])
+        retry_count = 0
+        last_response = ''
         while True:
             try:
-                conn = http.client.HTTPSConnection("api.chatanywhere.com.cn")
-                payload = json.dumps({
-                    "max_tokens": 512,
-                    "model": "gpt-3.5-turbo",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ]
-                })
+                retry_count += 1
+                proxy_url = os.getenv('HTTPS_PROXY' if self._use_https else 'HTTP_PROXY', '').strip()
+                if not proxy_url:
+                    proxy_url = os.getenv('https_proxy' if self._use_https else 'http_proxy', '').strip()
+
+                if self._use_https and proxy_url:
+                    proxy_host, proxy_port = _resolve_proxy_endpoint(proxy_url)
+                    conn = http.client.HTTPConnection(proxy_host, proxy_port, timeout=120)
+                    conn.set_tunnel(self._host)
+                else:
+                    connection_cls = http.client.HTTPSConnection if self._use_https else http.client.HTTPConnection
+                    conn = connection_cls(self._host, timeout=120)
+                payload_obj = _build_chat_payload(
+                    prompt=prompt,
+                    model=self._model,
+                    disable_thinking=self._disable_thinking,
+                    thinking_mode=self._thinking_param_mode,
+                )
+                payload = json.dumps(payload_obj)
                 headers = {
-                    'Authorization': 'Bearer sk-ys02zx......(replace with your own)......',
                     'User-Agent': 'Apifox/1.0.0 (https://apifox.com)',
                     'Content-Type': 'application/json'
                 }
-                conn.request("POST", "/v1/chat/completions", payload, headers)
+                if self._api_key:
+                    headers['Authorization'] = f'Bearer {self._api_key}'
+                conn.request("POST", self._path, payload, headers)
                 res = conn.getresponse()
                 data = res.read().decode("utf-8")
                 data = json.loads(data)
-                response = data['choices'][0]['message']['content']
-                # trim function
-                if self._trim:
-                    response = _trim_preface_of_body(response)
-                return response
-            except Exception:
+                response = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                last_response = response
+                if _trim_preface_of_body(response).strip():
+                    return response
+                if self._verbose_samples:
+                    print(f'WARNING: invalid non-code response from LLM, retry={retry_count}')
+                    print(response[:500])
+                    print('---')
+                if retry_count > self._max_non_code_retries:
+                    if self._verbose_samples:
+                        print('WARNING: exceeded non-code retry limit, returning last raw response for logging.')
+                    return last_response
+                continue
+            except Exception as e:
+                if self._verbose_samples:
+                    print(f'WARNING: request exception retry={retry_count}: {repr(e)}')
+                if retry_count > self._max_non_code_retries:
+                    if self._verbose_samples:
+                        print('WARNING: exceeded retry limit after exceptions, returning last raw response for logging.')
+                    return last_response
                 continue
 
 
@@ -197,6 +413,197 @@ class Sandbox(evaluator.Sandbox):
             result_queue.put((None, False))
 
 
+class DedupSandbox(evaluator.Sandbox):
+    """In-memory behavior dedup wrapper for sandbox evaluation."""
+
+    def __init__(self, inner_sandbox: evaluator.Sandbox, enable_dedup: bool = True):
+        self._inner = inner_sandbox
+        self._enable = enable_dedup
+        self._verbose = os.getenv('FUNSEARCH_VERBOSE_SAMPLES', '1') == '1'
+        default_stats_path = os.path.join(_resolve_log_dir(), 'dedup_stats.json')
+        self._stats_path = os.getenv('FUNSEARCH_DEDUP_STATS_PATH', default_stats_path)
+        self._stage2_random_cases = int(os.getenv('FUNSEARCH_STAGE2_RANDOM_CASES', '64'))
+        self._stage2_random_seed = int(os.getenv('FUNSEARCH_STAGE2_RANDOM_SEED', '20260320'))
+        self._seen_behavior_hashes: set[str] = set()
+        self._stage1_trace_by_hash: dict[str, tuple[int, ...]] = {}
+        self._stage2_trace_by_hash: dict[str, list[tuple[int, ...]]] = {}
+        all_stage1_cases = [
+            (0.15, [1.00, 0.80, 0.30, 0.20]),
+            (0.45, [1.00, 0.70, 0.50, 0.20]),
+            (0.65, [1.00, 0.90, 0.70, 0.40]),
+            (0.95, [1.00, 0.99, 0.96, 0.10]),
+            (0.05, [1.00, 0.05, 0.04, 0.03]),
+            (0.51, [0.52, 0.90, 0.49, 0.70]),
+            (0.33, [0.34, 0.66, 0.67, 0.99]),
+            (0.78, [0.79, 0.81, 1.20, 0.78]),
+            (0.42, [0.43, 0.44, 0.90, 1.10]),
+            (0.88, [0.89, 0.90, 0.88, 0.87]),
+        ]
+        stage1_case_count = int(os.getenv('FUNSEARCH_STAGE1_CASE_COUNT', str(len(all_stage1_cases))))
+        stage1_case_count = max(3, min(stage1_case_count, len(all_stage1_cases)))
+        self._stage1_cases = all_stage1_cases[:stage1_case_count]
+        self.dedup_hit = 0
+        self.dedup_miss = 0
+        self.stage2_recheck = 0
+        self.stage2_reject = 0
+        self.stage2_pass = 0
+        self._write_stats()
+
+    def _write_stats(self) -> None:
+        os.makedirs(os.path.dirname(self._stats_path), exist_ok=True)
+        with open(self._stats_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'dedup_enable': self._enable,
+                'dedup_hit': self.dedup_hit,
+                'dedup_miss': self.dedup_miss,
+                'seen_hash_count': len(self._seen_behavior_hashes),
+                'stage2_recheck': self.stage2_recheck,
+                'stage2_reject': self.stage2_reject,
+                'stage2_pass': self.stage2_pass,
+            }, f, indent=2)
+
+    def _compute_behavior_hash(self, program: str, function_to_evolve: str = 'priority') -> str | None:
+        try:
+            ns = {}
+            ns['np'] = np
+            exec(program, ns)
+            func = ns.get(function_to_evolve)
+            if func is None:
+                return None
+
+            trace = []
+            for item, bins in self._stage1_cases:
+                arr = np.array(bins, dtype=float)
+                scores = func(float(item), arr)
+                if scores is None:
+                    return None
+                scores = np.asarray(scores, dtype=float)
+                if scores.size == 0:
+                    trace.append(-1)
+                else:
+                    trace.append(int(np.argmax(scores)))
+
+            signature = '|'.join(map(str, trace))
+            return hashlib.sha256(signature.encode('utf-8')).hexdigest()
+        except Exception:
+            return None
+
+    def _compute_stage1_trace(self, program: str, function_to_evolve: str = 'priority') -> tuple[int, ...] | None:
+        try:
+            ns = {'np': np}
+            exec(program, ns)
+            func = ns.get(function_to_evolve)
+            if func is None:
+                return None
+
+            trace = []
+            for item, bins in self._stage1_cases:
+                arr = np.array(bins, dtype=float)
+                scores = func(float(item), arr)
+                if scores is None:
+                    return None
+                scores = np.asarray(scores, dtype=float)
+                if scores.size == 0:
+                    trace.append(-1)
+                else:
+                    trace.append(int(np.argmax(scores)))
+            return tuple(trace)
+        except Exception:
+            return None
+
+    def _compute_random_trace(self, program: str, function_to_evolve: str = 'priority') -> tuple[int, ...] | None:
+        try:
+            ns = {'np': np}
+            exec(program, ns)
+            func = ns.get(function_to_evolve)
+            if func is None:
+                return None
+
+            rng = np.random.default_rng(self._stage2_random_seed)
+            trace = []
+            for _ in range(self._stage2_random_cases):
+                item = float(rng.uniform(0.05, 0.95))
+                bins = rng.uniform(0.1, 1.2, size=4)
+                scores = func(item, bins.astype(float))
+                if scores is None:
+                    return None
+                scores = np.asarray(scores, dtype=float)
+                if scores.size == 0:
+                    trace.append(-1)
+                else:
+                    trace.append(int(np.argmax(scores)))
+            return tuple(trace)
+        except Exception:
+            return None
+
+    def _stage2_random_check(self, candidate_trace: tuple[int, ...], cached_traces: list[tuple[int, ...]]) -> bool:
+        return any(candidate_trace == old for old in cached_traces)
+
+    def run(
+            self,
+            program: str,
+            function_to_run: str,
+            function_to_evolve: str,
+            inputs: Any,
+            test_input: str,
+            timeout_seconds: int,
+            **kwargs
+    ) -> tuple[Any, bool]:
+        if not self._enable:
+            return self._inner.run(program, function_to_run, function_to_evolve, inputs, test_input, timeout_seconds,
+                                   **kwargs)
+
+        stage1_trace = self._compute_stage1_trace(program, function_to_evolve=function_to_evolve)
+        behavior_hash = self._compute_behavior_hash(program, function_to_evolve=function_to_evolve)
+        if behavior_hash and behavior_hash in self._seen_behavior_hashes and stage1_trace is not None:
+            self.stage2_recheck += 1
+            candidate_random_trace = self._compute_random_trace(program, function_to_evolve=function_to_evolve)
+            cached_random_traces = self._stage2_trace_by_hash.get(behavior_hash, [])
+
+            if candidate_random_trace is not None and cached_random_traces and self._stage2_random_check(
+                    candidate_random_trace, cached_random_traces):
+                self.dedup_hit += 1
+                self.stage2_pass += 1
+                self._write_stats()
+                if self._verbose:
+                    print(f'DEDUP_HIT: behavior_hash={behavior_hash[:12]}... skip evaluation')
+                profiler_obj = kwargs.get('profiler')
+                if profiler_obj is not None:
+                    global_sample_nums = kwargs.get('global_sample_nums', None)
+                    sample_time = kwargs.get('sample_time', None)
+                    dedup_func, _ = evaluator._sample_to_program(
+                        '    return np.zeros_like(bins)\n',
+                        None,
+                        evaluator.code_manipulation.text_to_program(specification),
+                        function_to_evolve,
+                    )
+                    dedup_func.global_sample_nums = global_sample_nums
+                    dedup_func.score = None
+                    dedup_func.status = 'DEDUP_INTERCEPTED'
+                    dedup_func.sample_time = sample_time
+                    dedup_func.evaluate_time = 0.0
+                    profiler_obj.register_function(dedup_func)
+                return None, False
+
+            self.stage2_reject += 1
+            if candidate_random_trace is not None:
+                self._stage2_trace_by_hash.setdefault(behavior_hash, []).append(candidate_random_trace)
+            if self._verbose:
+                print(f'DEDUP_STAGE2_REJECT: behavior_hash={behavior_hash[:12]}... allow evaluation')
+
+        if behavior_hash:
+            self._seen_behavior_hashes.add(behavior_hash)
+            if stage1_trace is not None:
+                self._stage1_trace_by_hash[behavior_hash] = stage1_trace
+            stage2_trace = self._compute_random_trace(program, function_to_evolve=function_to_evolve)
+            if stage2_trace is not None:
+                self._stage2_trace_by_hash.setdefault(behavior_hash, []).append(stage2_trace)
+        self.dedup_miss += 1
+        self._write_stats()
+        return self._inner.run(program, function_to_run, function_to_evolve, inputs, test_input, timeout_seconds,
+                               **kwargs)
+
+
 specification = r'''
 import numpy as np
 
@@ -271,16 +678,42 @@ def priority(item: float, bins: np.ndarray) -> np.ndarray:
 # It should be noted that the if __name__ == '__main__' is required.
 # Because the inner code uses multiprocess evaluation.
 if __name__ == '__main__':
-    class_config = config.ClassConfig(llm_class=LLMAPI, sandbox_class=Sandbox)
+    base_log_dir = _resolve_log_dir()
+    dedup_enable = os.getenv('FUNSEARCH_DEDUP_ENABLE', '1') == '1'
+
+    class _EntrySandbox(evaluator.Sandbox):
+        def __init__(self):
+            base = Sandbox()
+            self._wrapped = DedupSandbox(base, enable_dedup=dedup_enable)
+
+        def run(self, *args, **kwargs):
+            return self._wrapped.run(*args, **kwargs)
+
+    class_config = config.ClassConfig(llm_class=LLMAPI, sandbox_class=_EntrySandbox)
     config = config.Config(samples_per_prompt=4, evaluate_timeout_seconds=30)
 
-    bin_packing_or3 = {'OR3': bin_packing_utils.datasets['OR3']}
-    global_max_sample_num = 10  # if it is set to None, funsearch will execute an endless loop
+    dataset_key = os.getenv('FUNSEARCH_DATASET_KEY', 'OR3')
+    max_samples_env = int(os.getenv('FUNSEARCH_MAX_SAMPLES', '8'))
+
+    print('================= LLM CONFIG =================')
+    print(f"FUNSEARCH_LLM_MODEL={os.getenv('FUNSEARCH_LLM_MODEL', 'gpt-3.5-turbo')}")
+    print(f"FUNSEARCH_DISABLE_THINKING={os.getenv('FUNSEARCH_DISABLE_THINKING', 'auto')}")
+    print(f"FUNSEARCH_THINKING_PARAM_MODE={os.getenv('FUNSEARCH_THINKING_PARAM_MODE', 'both')}")
+    print(f"FUNSEARCH_DEDUP_ENABLE={os.getenv('FUNSEARCH_DEDUP_ENABLE', '1')}")
+    print(f"FUNSEARCH_DATASET_KEY={dataset_key}")
+    print(f"FUNSEARCH_MAX_SAMPLES={max_samples_env}")
+    print(f"FUNSEARCH_LOG_DIR={base_log_dir}")
+    print('==============================================')
+
+    if dataset_key not in bin_packing_utils.datasets:
+        raise ValueError(f'Unknown dataset key: {dataset_key}')
+    bin_packing_dataset = {dataset_key: bin_packing_utils.datasets[dataset_key]}
+    global_max_sample_num = max_samples_env  # if it is set to None, funsearch will execute an endless loop
     funsearch.main(
         specification=specification,
-        inputs=bin_packing_or3,
+        inputs=bin_packing_dataset,
         config=config,
         max_sample_nums=global_max_sample_num,
         class_config=class_config,
-        log_dir='logs/funsearch_llm_api',
+        log_dir=base_log_dir,
     )

@@ -205,6 +205,7 @@ class Evaluator:
         # This is because the register_program will do reduction for a given Function score.
         # If 'score_per_test' is empty, we record it to the profiler at once.
         if scores_per_test:
+            setattr(new_function, 'status', 'SUCCESS')
             self._database.register_program(
                 new_function,
                 island_id,
@@ -219,6 +220,7 @@ class Evaluator:
                 sample_time = kwargs.get('sample_time', None)
                 new_function.global_sample_nums = global_sample_nums
                 new_function.score = None
+                new_function.status = 'EVAL_FAILED'
                 new_function.sample_time = sample_time
                 new_function.evaluate_time = evaluate_time
                 profiler.register_function(new_function)
