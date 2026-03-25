@@ -29,6 +29,18 @@ def test_build_chat_payload_uses_alibaba_mode_only():
     assert "chat_template_kwargs" not in payload
 
 
+def test_build_chat_payload_drops_unsupported_params():
+    payload = _build_chat_payload(
+        prompt="hello",
+        model="qwen",
+        disable_thinking=True,
+        thinking_mode="both",
+        unsupported_params={"chat_template_kwargs"},
+    )
+    assert "chat_template_kwargs" not in payload
+    assert payload["enable_thinking"] is False
+
+
 def test_build_chat_payload_omits_thinking_controls_when_disabled():
     payload = _build_chat_payload(prompt="hello", model="qwen", disable_thinking=False, thinking_mode="both")
 
@@ -70,3 +82,4 @@ def priority(item: float, bins: np.ndarray) -> np.ndarray:
 """
     trimmed = _trim_preface_of_body(sample)
     assert "return priorities" in trimmed
+

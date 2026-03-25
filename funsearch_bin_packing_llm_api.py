@@ -51,7 +51,13 @@ def _save_round_manifest(log_dir: str, sample_order: int, manifest: dict) -> str
     return file_path
 
 
-def _build_chat_payload(prompt: str, model: str, disable_thinking: bool, thinking_mode: str = 'both') -> dict:
+def _build_chat_payload(
+        prompt: str,
+        model: str,
+        disable_thinking: bool,
+        thinking_mode: str = 'both',
+        unsupported_params: set[str] | None = None,
+) -> dict:
     payload = {
         "max_tokens": 512,
         "model": model,
@@ -71,6 +77,9 @@ def _build_chat_payload(prompt: str, model: str, disable_thinking: bool, thinkin
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         if thinking_mode in ('both', 'alibaba'):
             payload["enable_thinking"] = False
+    if unsupported_params:
+        for param in unsupported_params:
+            payload.pop(param, None)
     return payload
 
 
@@ -124,6 +133,10 @@ def _trim_preface_of_body(sample: str) -> str:
                 candidate = block
         if candidate:
             sample = candidate
+        else:
+            body_like = max(code_blocks, key=lambda b: len(b), default='')
+            if body_like:
+                sample = body_like
 
     lines = sample.splitlines()
     func_body_lineno = 0
@@ -144,6 +157,11 @@ def _trim_preface_of_body(sample: str) -> str:
 
     # If model returns only code body (already indented), keep it.
     body_lines = [line for line in lines if line.strip()]
+    if body_lines:
+        mixed_body = '\n'.join(body_lines) + '\n'
+        if _is_valid_function_body(mixed_body):
+            return mixed_body
+
     if body_lines and all(line.startswith('    ') or line.startswith('\t') for line in body_lines):
         if any(token in line for line in body_lines for token in ('return', 'if ', 'for ', 'while ', '=')):
             body = '\n'.join(body_lines) + '\n'
@@ -160,8 +178,9 @@ def _trim_preface_of_body(sample: str) -> str:
             for token in ('return ', 'if ', 'for ', 'while ', 'np.', 'bins', 'item', '=', 'elif ', 'else:')
         )
         if python_like:
-            if _is_valid_function_body(sample):
-                return sample
+            candidate_body = '\n'.join(stripped) + '\n'
+            if _is_valid_function_body(candidate_body):
+                return candidate_body
             return ''
 
     # Invalid response (e.g. chain-of-thought only).
@@ -172,11 +191,23 @@ def _is_valid_function_body(body: str) -> bool:
     if not body.strip():
         return False
     lines = body.splitlines()
+    if lines and any(line.strip() for line in lines):
+        min_indent = None
+        for line in lines:
+            if not line.strip():
+                continue
+            leading = len(line) - len(line.lstrip())
+            min_indent = leading if min_indent is None else min(min_indent, leading)
+        if min_indent and min_indent > 0:
+            lines = [line[min_indent:] if len(line) >= min_indent else line for line in lines]
+    normalized_body = "\n".join(lines)
     if any(line.rstrip().endswith('=') for line in lines if line.strip()):
         return False
     if any(line.rstrip().endswith('(') for line in lines if line.strip()):
         return False
-    source = "def _tmp(item, bins):\n" + body
+    source = "def _tmp(item, bins):\n"
+    for line in normalized_body.splitlines():
+        source += f"    {line}\n"
     try:
         ast.parse(source)
     except SyntaxError:
@@ -210,6 +241,7 @@ class LLMAPI(sampler.LLM):
         )
         self._thinking_param_mode = os.getenv('FUNSEARCH_THINKING_PARAM_MODE', 'both')
         self._max_non_code_retries = int(os.getenv('FUNSEARCH_MAX_NON_CODE_RETRIES', '0'))
+        self._unsupported_payload_params: set[str] = set()
 
     def draw_samples(self, prompt: str) -> Collection[str]:
         """Returns multiple predicted continuations of `prompt`."""
@@ -284,6 +316,7 @@ class LLMAPI(sampler.LLM):
                     model=self._model,
                     disable_thinking=self._disable_thinking,
                     thinking_mode=self._thinking_param_mode,
+                    unsupported_params=self._unsupported_payload_params,
                 )
                 payload = json.dumps(payload_obj)
                 headers = {
@@ -296,6 +329,17 @@ class LLMAPI(sampler.LLM):
                 res = conn.getresponse()
                 data = res.read().decode("utf-8")
                 data = json.loads(data)
+
+                if isinstance(data, dict) and 'error' in data:
+                    err = data.get('error', {}) or {}
+                    err_param = err.get('param')
+                    err_msg = str(err.get('message', ''))
+                    if err_param and 'Unknown parameter' in err_msg:
+                        self._unsupported_payload_params.add(err_param)
+                        if self._verbose_samples:
+                            print(f"WARNING: server rejected param '{err_param}', retrying without it.")
+                        continue
+
                 response = data.get('choices', [{}])[0].get('message', {}).get('content', '')
                 last_response = response
                 if _trim_preface_of_body(response).strip():
