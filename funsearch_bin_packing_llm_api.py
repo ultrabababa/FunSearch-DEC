@@ -33,6 +33,11 @@ def _resolve_proxy_endpoint(proxy_url: str) -> tuple[str, int]:
     return host, default_port
 
 
+def _resolve_openai_base_url(host: str, use_https: bool) -> str:
+    scheme = 'https' if use_https else 'http'
+    return f"{scheme}://{host}/v1"
+
+
 def _save_sample(log_dir: str, tag: str, sample_order: int, sample_idx: int, content: str) -> str:
     os.makedirs(log_dir, exist_ok=True)
     file_name = f'sample_{sample_order:05d}_{sample_idx:02d}_{tag}.txt'
@@ -77,6 +82,40 @@ def _build_chat_payload(
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         if thinking_mode in ('both', 'alibaba'):
             payload["enable_thinking"] = False
+    
+    reasoning_effort = os.getenv('FUNSEARCH_REASONING_EFFORT')
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
+        
+    if unsupported_params:
+        for param in unsupported_params:
+            payload.pop(param, None)
+    return payload
+
+
+def _build_response_payload(
+        prompt: str,
+        model: str,
+        unsupported_params: set[str] | None = None,
+) -> dict:
+    payload = {
+        "max_output_tokens": 512,
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": "You are a Python code generator. Output only valid Python code. Never output reasoning or explanations.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    }
+
+    reasoning_effort = os.getenv('FUNSEARCH_REASONING_EFFORT', 'none')
+    payload["reasoning"] = {"effort": reasoning_effort}
+
     if unsupported_params:
         for param in unsupported_params:
             payload.pop(param, None)
@@ -227,7 +266,7 @@ class LLMAPI(sampler.LLM):
         self._additional_prompt = additional_prompt
         self._trim = trim
         self._host = os.getenv('FUNSEARCH_LLM_HOST', 'api.chatanywhere.com.cn')
-        self._path = os.getenv('FUNSEARCH_LLM_PATH', '/v1/chat/completions')
+        self._path = os.getenv('FUNSEARCH_LLM_PATH', '/v1/responses')
         self._model = os.getenv('FUNSEARCH_LLM_MODEL', 'gpt-3.5-turbo')
         self._api_key = os.getenv('FUNSEARCH_LLM_API_KEY', '')
         self._use_https = os.getenv('FUNSEARCH_LLM_USE_HTTPS', '1') == '1'
@@ -297,9 +336,64 @@ class LLMAPI(sampler.LLM):
         prompt = '\n'.join([prompt, self._additional_prompt])
         retry_count = 0
         last_response = ''
+        use_openai_sdk = os.getenv('FUNSEARCH_USE_OPENAI_SDK', '0') == '1'
         while True:
             try:
                 retry_count += 1
+                if use_openai_sdk and self._api_key:
+                    try:
+                        from openai import OpenAI
+                    except Exception:
+                        use_openai_sdk = False
+                    else:
+                        client = OpenAI(
+                            base_url=_resolve_openai_base_url(self._host, self._use_https),
+                            api_key=self._api_key,
+                            timeout=120,
+                        )
+                        
+                        api_kwargs = {
+                            "model": self._model,
+                            "input": [
+                                {
+                                    "role": "system",
+                                    "content": "You are a Python code generator. Output only valid Python code body lines.",
+                                },
+                                {
+                                    "role": "user",
+                                    "content": prompt,
+                                },
+                            ],
+                            "max_output_tokens": 512,
+                        }
+
+                        reasoning_effort = os.getenv('FUNSEARCH_REASONING_EFFORT', 'none')
+                        api_kwargs["reasoning"] = {"effort": reasoning_effort}
+
+                        resp = client.responses.create(**api_kwargs)
+                        data = resp.model_dump()
+                        response = ""
+                        for item in data.get('output', []):
+                            if item.get('type') == 'message':
+                                content = item.get('content', [])
+                                if isinstance(content, list):
+                                    response = content[0].get('text', '') if content else ''
+                                else:
+                                    response = content or ''
+                                break
+                        last_response = response or ''
+                        if _trim_preface_of_body(last_response).strip():
+                            return last_response
+                        if self._verbose_samples:
+                            print(f'WARNING: invalid non-code response from LLM (OpenAI SDK), retry={retry_count}')
+                            print((last_response or '')[:500])
+                            print('---')
+                        if retry_count > self._max_non_code_retries:
+                            if self._verbose_samples:
+                                print('WARNING: exceeded non-code retry limit, returning last raw response for logging.')
+                            return last_response
+                        continue
+
                 proxy_url = os.getenv('HTTPS_PROXY' if self._use_https else 'HTTP_PROXY', '').strip()
                 if not proxy_url:
                     proxy_url = os.getenv('https_proxy' if self._use_https else 'http_proxy', '').strip()
@@ -311,11 +405,9 @@ class LLMAPI(sampler.LLM):
                 else:
                     connection_cls = http.client.HTTPSConnection if self._use_https else http.client.HTTPConnection
                     conn = connection_cls(self._host, timeout=120)
-                payload_obj = _build_chat_payload(
+                payload_obj = _build_response_payload(
                     prompt=prompt,
                     model=self._model,
-                    disable_thinking=self._disable_thinking,
-                    thinking_mode=self._thinking_param_mode,
                     unsupported_params=self._unsupported_payload_params,
                 )
                 payload = json.dumps(payload_obj)
@@ -340,7 +432,16 @@ class LLMAPI(sampler.LLM):
                             print(f"WARNING: server rejected param '{err_param}', retrying without it.")
                         continue
 
-                response = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                response = ""
+                if isinstance(data, dict):
+                    for item in data.get('output', []):
+                        if item.get('type') == 'message':
+                            content = item.get('content', [])
+                            if isinstance(content, list):
+                                response = content[0].get('text', '') if content else ''
+                            else:
+                                response = content or ''
+                            break
                 last_response = response
                 if _trim_preface_of_body(response).strip():
                     return response
@@ -471,17 +572,30 @@ class DedupSandbox(evaluator.Sandbox):
         self._seen_behavior_hashes: set[str] = set()
         self._stage1_trace_by_hash: dict[str, tuple[int, ...]] = {}
         self._stage2_trace_by_hash: dict[str, list[tuple[int, ...]]] = {}
+        # Stage 1 cases redesigned: item ratios in [0.13, 0.67] matching real data,
+        # covering 2-6 bins, including ties, exact fits, and edge cases.
         all_stage1_cases = [
-            (0.15, [1.00, 0.80, 0.30, 0.20]),
-            (0.45, [1.00, 0.70, 0.50, 0.20]),
-            (0.65, [1.00, 0.90, 0.70, 0.40]),
-            (0.95, [1.00, 0.99, 0.96, 0.10]),
-            (0.05, [1.00, 0.05, 0.04, 0.03]),
-            (0.51, [0.52, 0.90, 0.49, 0.70]),
-            (0.33, [0.34, 0.66, 0.67, 0.99]),
-            (0.78, [0.79, 0.81, 1.20, 0.78]),
-            (0.42, [0.43, 0.44, 0.90, 1.10]),
-            (0.88, [0.89, 0.90, 0.88, 0.87]),
+            # 2 bins
+            (0.30, [0.80, 0.50]),
+            (0.40, [0.60, 0.40]),
+            # 3 bins
+            (0.20, [0.50, 0.30, 0.25]),
+            (0.35, [0.60, 0.40, 0.35]),
+            (0.25, [0.50, 0.50, 0.30]),
+            # 4 bins
+            (0.15, [0.50, 0.30, 0.20, 0.18]),
+            (0.30, [0.60, 0.40, 0.35, 0.30]),
+            (0.25, [0.80, 0.50, 0.50, 0.30]),
+            (0.40, [0.70, 0.60, 0.50, 0.45]),
+            # 5 bins
+            (0.20, [0.80, 0.60, 0.40, 0.30, 0.25]),
+            (0.35, [0.70, 0.50, 0.40, 0.35, 0.30]),
+            # 6 bins
+            (0.25, [0.90, 0.70, 0.50, 0.40, 0.30, 0.28]),
+            (0.40, [0.80, 0.60, 0.50, 0.45, 0.42, 0.40]),
+            # edge cases
+            (0.30, [0.30, 0.30, 0.30]),
+            (0.20, [0.15, 0.10, 0.05]),
         ]
         stage1_case_count = int(os.getenv('FUNSEARCH_STAGE1_CASE_COUNT', str(len(all_stage1_cases))))
         stage1_case_count = max(3, min(stage1_case_count, len(all_stage1_cases)))

@@ -2231,10 +2231,20 @@ def l1_bound_dataset(instances: dict) -> float:
     return np.mean(l1_bounds)
 
 
+# Load OR-Library datasets from dataset/ directory (if available)
+try:
+    from tools.load_orlib import merge_datasets
+    merge_datasets(datasets)
+except ImportError:
+    pass
+
 opt_num_bins = {}
 for name, dataset in datasets.items():
     opt_num_bins[name] = l1_bound_dataset(dataset)
 
 
 if __name__ == '__main__':
-    print(datasets['OR3'].keys())
+    print("Available datasets:", list(datasets.keys()))
+    for key in datasets:
+        first = list(datasets[key].values())[0]
+        print(f"  {key}: {len(datasets[key])} instances, {first['num_items']} items")

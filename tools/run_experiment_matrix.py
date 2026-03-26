@@ -118,7 +118,9 @@ def run_one(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run baseline/dedup experiment matrix")
-    parser.add_argument("--dataset", choices=["OR3", "Weibull 5k"], required=True)
+    all_datasets = ["OR3", "Weibull 5k", "OR_u120", "OR_u250", "OR_u500", "OR_u1000",
+                    "OR_t60", "OR_t120", "OR_t249", "OR_t501"]
+    parser.add_argument("--dataset", choices=all_datasets, required=True)
     parser.add_argument("--max-samples", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--stage1-case-count", type=int, default=None)
