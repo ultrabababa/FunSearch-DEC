@@ -45,9 +45,13 @@ def run_one(
     dataset_key: str,
     dedup_enable: bool,
     max_samples: int,
+    dataset_keys: str | None = None,
 ) -> Path:
     env = os.environ.copy()
-    env["FUNSEARCH_DATASET_KEY"] = dataset_key
+    if dataset_keys:
+        env["FUNSEARCH_DATASET_KEYS"] = dataset_keys
+    else:
+        env["FUNSEARCH_DATASET_KEY"] = dataset_key
     env["FUNSEARCH_DEDUP_ENABLE"] = "1" if dedup_enable else "0"
     env["FUNSEARCH_MAX_SAMPLES"] = str(max_samples)
 
@@ -120,7 +124,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run baseline/dedup experiment matrix")
     all_datasets = ["OR3", "Weibull 5k", "OR_u120", "OR_u250", "OR_u500", "OR_u1000",
                     "OR_t60", "OR_t120", "OR_t249", "OR_t501"]
-    parser.add_argument("--dataset", choices=all_datasets, required=True)
+    parser.add_argument("--dataset", choices=all_datasets, default=None,
+                        help="Single dataset key")
+    parser.add_argument("--dataset-keys", type=str, default=None,
+                        help="Comma-separated list of dataset keys for multi-dataset mode")
     parser.add_argument("--max-samples", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--stage1-case-count", type=int, default=None)
@@ -128,6 +135,9 @@ def main() -> None:
     parser.add_argument("--stage2-random-seed", type=int, default=None)
     parser.add_argument("--max-non-code-retries", type=int, default=None)
     args = parser.parse_args()
+
+    if not args.dataset and not args.dataset_keys:
+        parser.error("Either --dataset or --dataset-keys must be specified")
 
     _apply_cloud_env_mapping()
 
@@ -141,9 +151,25 @@ def main() -> None:
         os.environ["FUNSEARCH_MAX_NON_CODE_RETRIES"] = str(args.max_non_code_retries)
 
     repo_dir = Path(__file__).resolve().parents[1]
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    tag_suffix = ""
+    if args.stage1_case_count is not None:
+        tag_suffix += f"_s1-{args.stage1_case_count}"
+    if args.stage2_random_cases is not None:
+        tag_suffix += f"_s2-{args.stage2_random_cases}"
+    if args.max_samples != 8:
+        tag_suffix += f"_ms{args.max_samples}"
+
+    if args.dataset_keys:
+        ds_tag = args.dataset_keys.replace(',', '+').replace(' ', '_')
+    else:
+        ds_tag = args.dataset.replace(' ', '_')
+
     for i in range(1, args.repeats + 1):
-        run_one(repo_dir, f"baseline_{args.dataset.replace(' ', '_')}_r{i}", args.dataset, False, args.max_samples)
-        run_one(repo_dir, f"dedup_{args.dataset.replace(' ', '_')}_r{i}", args.dataset, True, args.max_samples)
+        run_tag = f"baseline_{ds_tag}_r{i}_{ts}{tag_suffix}"
+        run_one(repo_dir, run_tag, args.dataset or ds_tag, False, args.max_samples, args.dataset_keys)
+        run_tag = f"dedup_{ds_tag}_r{i}_{ts}{tag_suffix}"
+        run_one(repo_dir, run_tag, args.dataset or ds_tag, True, args.max_samples, args.dataset_keys)
 
     print("Experiment matrix completed.")
 

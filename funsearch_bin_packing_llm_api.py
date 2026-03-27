@@ -405,11 +405,21 @@ class LLMAPI(sampler.LLM):
                 else:
                     connection_cls = http.client.HTTPSConnection if self._use_https else http.client.HTTPConnection
                     conn = connection_cls(self._host, timeout=120)
-                payload_obj = _build_response_payload(
-                    prompt=prompt,
-                    model=self._model,
-                    unsupported_params=self._unsupported_payload_params,
-                )
+                # Use Responses API format only for /v1/responses, otherwise use Chat Completions
+                if 'responses' in self._path:
+                    payload_obj = _build_response_payload(
+                        prompt=prompt,
+                        model=self._model,
+                        unsupported_params=self._unsupported_payload_params,
+                    )
+                else:
+                    payload_obj = _build_chat_payload(
+                        prompt=prompt,
+                        model=self._model,
+                        disable_thinking=self._disable_thinking,
+                        thinking_mode=self._thinking_param_mode,
+                        unsupported_params=self._unsupported_payload_params,
+                    )
                 payload = json.dumps(payload_obj)
                 headers = {
                     'User-Agent': 'Apifox/1.0.0 (https://apifox.com)',
@@ -434,14 +444,19 @@ class LLMAPI(sampler.LLM):
 
                 response = ""
                 if isinstance(data, dict):
-                    for item in data.get('output', []):
-                        if item.get('type') == 'message':
-                            content = item.get('content', [])
-                            if isinstance(content, list):
-                                response = content[0].get('text', '') if content else ''
-                            else:
-                                response = content or ''
-                            break
+                    # Chat Completions format
+                    if 'choices' in data:
+                        response = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                    # Responses API format
+                    else:
+                        for item in data.get('output', []):
+                            if isinstance(item, dict) and item.get('type') == 'message':
+                                content = item.get('content', [])
+                                if isinstance(content, list):
+                                    response = content[0].get('text', '') if content else ''
+                                else:
+                                    response = content or ''
+                                break
                 last_response = response
                 if _trim_preface_of_body(response).strip():
                     return response
@@ -850,22 +865,33 @@ if __name__ == '__main__':
     class_config = config.ClassConfig(llm_class=LLMAPI, sandbox_class=_EntrySandbox)
     config = config.Config(samples_per_prompt=4, evaluate_timeout_seconds=30)
 
-    dataset_key = os.getenv('FUNSEARCH_DATASET_KEY', 'OR3')
+    # Support multiple datasets: FUNSEARCH_DATASET_KEYS="OR_u120,OR_u250,OR_u1000"
+    # Falls back to single dataset: FUNSEARCH_DATASET_KEY="OR3"
     max_samples_env = int(os.getenv('FUNSEARCH_MAX_SAMPLES', '8'))
+    dataset_keys_env = os.getenv('FUNSEARCH_DATASET_KEYS', '').strip()
+    if dataset_keys_env:
+        dataset_keys = [k.strip() for k in dataset_keys_env.split(',') if k.strip()]
+        bin_packing_dataset = {}
+        for key in dataset_keys:
+            if key not in bin_packing_utils.datasets:
+                raise ValueError(f'Unknown dataset key: {key}')
+            bin_packing_dataset[key] = bin_packing_utils.datasets[key]
+        dataset_key = '+'.join(dataset_keys)
+    else:
+        dataset_key = os.getenv('FUNSEARCH_DATASET_KEY', 'OR3')
+        if dataset_key not in bin_packing_utils.datasets:
+            raise ValueError(f'Unknown dataset key: {dataset_key}')
+        bin_packing_dataset = {dataset_key: bin_packing_utils.datasets[dataset_key]}
 
     print('================= LLM CONFIG =================')
     print(f"FUNSEARCH_LLM_MODEL={os.getenv('FUNSEARCH_LLM_MODEL', 'gpt-3.5-turbo')}")
     print(f"FUNSEARCH_DISABLE_THINKING={os.getenv('FUNSEARCH_DISABLE_THINKING', 'auto')}")
     print(f"FUNSEARCH_THINKING_PARAM_MODE={os.getenv('FUNSEARCH_THINKING_PARAM_MODE', 'both')}")
     print(f"FUNSEARCH_DEDUP_ENABLE={os.getenv('FUNSEARCH_DEDUP_ENABLE', '1')}")
-    print(f"FUNSEARCH_DATASET_KEY={dataset_key}")
+    print(f"FUNSEARCH_DATASET={dataset_key}")
     print(f"FUNSEARCH_MAX_SAMPLES={max_samples_env}")
     print(f"FUNSEARCH_LOG_DIR={base_log_dir}")
     print('==============================================')
-
-    if dataset_key not in bin_packing_utils.datasets:
-        raise ValueError(f'Unknown dataset key: {dataset_key}')
-    bin_packing_dataset = {dataset_key: bin_packing_utils.datasets[dataset_key]}
     global_max_sample_num = max_samples_env  # if it is set to None, funsearch will execute an endless loop
     funsearch.main(
         specification=specification,

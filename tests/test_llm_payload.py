@@ -1,5 +1,6 @@
 from funsearch_bin_packing_llm_api import (
     _build_chat_payload,
+    _resolve_openai_base_url,
     _resolve_disable_thinking,
     _trim_preface_of_body,
 )
@@ -39,6 +40,23 @@ def test_build_chat_payload_drops_unsupported_params():
     )
     assert "chat_template_kwargs" not in payload
     assert payload["enable_thinking"] is False
+
+
+def test_build_chat_payload_adds_reasoning_effort_none():
+    import os
+    os.environ["FUNSEARCH_REASONING_EFFORT"] = "none"
+    payload = _build_chat_payload(
+        prompt="hello",
+        model="gpt-5-nano",
+        disable_thinking=True,
+    )
+    assert payload["reasoning"] == {"effort": "none"}
+    os.environ.pop("FUNSEARCH_REASONING_EFFORT", None)
+
+
+def test_resolve_openai_base_url_uses_v1_suffix():
+    assert _resolve_openai_base_url("api.bltcy.ai", True) == "https://api.bltcy.ai/v1"
+    assert _resolve_openai_base_url("127.0.0.1:1234", False) == "http://127.0.0.1:1234/v1"
 
 
 def test_build_chat_payload_omits_thinking_controls_when_disabled():
@@ -82,4 +100,3 @@ def priority(item: float, bins: np.ndarray) -> np.ndarray:
 """
     trimmed = _trim_preface_of_body(sample)
     assert "return priorities" in trimmed
-

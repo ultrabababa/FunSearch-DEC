@@ -12,4 +12,4 @@ flask-cors
 numba
 tensorboard
 tensorboardX
-
+openai>=2.0.0

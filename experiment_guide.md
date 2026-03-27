@@ -25,10 +25,16 @@ curl -s http://127.0.0.1:1234/v1/models | head -5
       "object": "model",
 ```
 
-### 1.2 安装依赖
+### 1.2 激活虚拟环境
 
 ```bash
-pip install absl-py scipy numba tensorboard torch
+source .venv/bin/activate
+```
+
+### 1.3 安装依赖
+
+```bash
+pip install absl-py scipy numba tensorboard torch openai
 ```
 
 ### 1.3 进入项目目录
@@ -36,6 +42,47 @@ pip install absl-py scipy numba tensorboard torch
 ```bash
 cd /mnt/d/study/cityu/cs5491-ai/project/funsearch
 ```
+
+### 1.4 设置环境变量
+
+#### 本地模型（LM Studio）
+
+```bash
+export FUNSEARCH_LLM_HOST="127.0.0.1:1234"
+export FUNSEARCH_LLM_PATH="/v1/chat/completions"
+export FUNSEARCH_LLM_MODEL="qwen3-coder-30b-a3b-instruct"
+export FUNSEARCH_LLM_USE_HTTPS="0"
+export FUNSEARCH_DISABLE_THINKING="auto"
+export FUNSEARCH_THINKING_PARAM_MODE="both"
+export FUNSEARCH_MAX_NON_CODE_RETRIES="2"
+export FUNSEARCH_VERBOSE_SAMPLES="${FUNSEARCH_VERBOSE_SAMPLES:-1}"  # 1=详细输出, 0=静默
+```
+
+#### 云端 API（可选）
+
+```bash
+export FUNSEARCH_CLOUD_API_KEY="<YOUR_API_KEY>"
+export FUNSEARCH_CLOUD_BASE_URL="https://api.bltcy.ai"
+export FUNSEARCH_CLOUD_MODEL="gpt-5-nano"
+```
+
+#### 去重相关
+
+```bash
+export FUNSEARCH_DEDUP_ENABLE="1"           # 1=开启去重, 0=关闭
+export FUNSEARCH_STAGE1_CASE_COUNT="15"     # Stage 1 case 数量
+export FUNSEARCH_STAGE2_RANDOM_CASES="128"  # Stage 2 随机 case 数量
+export FUNSEARCH_REASONING_EFFORT="none"    # 关闭思考 (Responses API)
+```
+
+#### 数据集选择
+
+```bash
+export FUNSEARCH_DATASET_KEY="OR3"          # 可选: OR3, OR_u1000, OR_t501, Weibull 5k 等
+export FUNSEARCH_MAX_SAMPLES="10"           # 最大样本数
+```
+
+> **注意：** `run_stage1_optimization.sh` 脚本已内置上述环境变量，直接运行脚本即可，无需手动设置。
 
 ---
 
