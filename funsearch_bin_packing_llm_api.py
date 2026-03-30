@@ -620,6 +620,8 @@ class DedupSandbox(evaluator.Sandbox):
         self.stage2_recheck = 0
         self.stage2_reject = 0
         self.stage2_pass = 0
+        self._last_evaluated_program: str | None = None
+        self._last_program_is_duplicate: bool = False
         self._write_stats()
 
     def _write_stats(self) -> None:
@@ -726,6 +728,32 @@ class DedupSandbox(evaluator.Sandbox):
             return self._inner.run(program, function_to_run, function_to_evolve, inputs, test_input, timeout_seconds,
                                    **kwargs)
 
+        # Check if we are in the multi-dataset loop for the same program
+        if self._last_evaluated_program == program:
+            if test_input in self._evaluated_inputs_for_last_program:
+                # The exact same program has already been evaluated on THIS dataset,
+                # meaning it's literally a duplicate generation from LLM being tested again
+                # on the first dataset. So we should treat it as a new generation but duplicate.
+                self._last_evaluated_program = program
+                self._last_program_is_duplicate = False
+                self._evaluated_inputs_for_last_program = set()
+            else:
+                self._evaluated_inputs_for_last_program.add(test_input)
+                if self._last_program_is_duplicate:
+                    # Same program, already known as duplicate in this loop.
+                    # Intercept silently without incrementing dedup_hit again.
+                    return None, False
+                else:
+                    # Same program, already known as unique in this loop.
+                    # Allow execution silently without incrementing dedup_miss again.
+                    return self._inner.run(program, function_to_run, function_to_evolve, inputs, test_input, timeout_seconds,
+                                           **kwargs)
+
+        # It's a new program (new LLM sample)
+        self._last_evaluated_program = program
+        self._last_program_is_duplicate = False
+        self._evaluated_inputs_for_last_program = {test_input}
+
         stage1_trace = self._compute_stage1_trace(program, function_to_evolve=function_to_evolve)
         behavior_hash = self._compute_behavior_hash(program, function_to_evolve=function_to_evolve)
         if behavior_hash and behavior_hash in self._seen_behavior_hashes and stage1_trace is not None:
@@ -737,6 +765,7 @@ class DedupSandbox(evaluator.Sandbox):
                     candidate_random_trace, cached_random_traces):
                 self.dedup_hit += 1
                 self.stage2_pass += 1
+                self._last_program_is_duplicate = True
                 self._write_stats()
                 if self._verbose:
                     print(f'DEDUP_HIT: behavior_hash={behavior_hash[:12]}... skip evaluation')
