@@ -1,9 +1,9 @@
 {
   "dedup_enable": true,
-  "dedup_hit": 129,
-  "dedup_miss": 39,
-  "seen_hash_count": 13,
-  "stage2_recheck": 131,
-  "stage2_reject": 2,
-  "stage2_pass": 129
+  "dedup_hit": 1,
+  "dedup_miss": 31,
+  "seen_hash_count": 16,
+  "stage2_recheck": 7,
+  "stage2_reject": 6,
+  "stage2_pass": 1
 }
